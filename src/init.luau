@@ -86,19 +86,34 @@ for _, updateInfo in result.Updated do
 		(was {updateInfo.OldRev}).`)
 end
 
+local fatalErrorCount = 0
+local warnErrorCount = 0
+
 for _, errorInfo in result.Errors do
 	if errorInfo.Code == "RepoFetchFailed" then
 		local statusLabel = errorInfo.StatusCode or 0
-		print(`[Error] {errorInfo.Name} request failed with status {statusLabel}.`)
+		if statusLabel == 403 then
+			warnErrorCount += 1
+			print(`[Warn] {errorInfo.Name} request failed with status 403. Skipped update. \z
+				Set GITHUB_TOKEN or GH_TOKEN to avoid GitHub API limits.`)
+		else
+			fatalErrorCount += 1
+			print(`[Error] {errorInfo.Name} request failed with status {statusLabel}.`)
+		end
 	elseif errorInfo.Code == "JsonDecodeFailed" then
+		fatalErrorCount += 1
 		print(`[Error] {errorInfo.Name} response JSON decode failed.`)
 	elseif errorInfo.Code == "MissingSha" then
+		fatalErrorCount += 1
 		print(`[Error] {errorInfo.Name} response did not include a commit sha.`)
 	elseif errorInfo.Code == "MissingDefaultBranch" then
+		fatalErrorCount += 1
 		print(`[Error] {errorInfo.Name} default branch not found.`)
 	elseif errorInfo.Code == "RevReplaceFailed" then
+		fatalErrorCount += 1
 		print(`[Error] {errorInfo.Name} rev field could not be updated.`)
 	else
+		fatalErrorCount += 1
 		print(`[Error] {errorInfo.Name} update failed.`)
 	end
 end
@@ -123,7 +138,7 @@ elseif not result.HasStoryAlias then
 	print("[Info] No StoryBakery-owned dependencies were found.")
 end
 
-if #result.Updated == 0 and #result.Errors == 0 then
+if #result.Updated == 0 and fatalErrorCount == 0 and warnErrorCount == 0 then
 	if result.ManagedGitHubEntries == 0 then
 		print("[Info] No StoryBakery GitHub dependencies with rev were found.")
 	else
@@ -131,7 +146,7 @@ if #result.Updated == 0 and #result.Errors == 0 then
 	end
 end
 
-if #result.Errors > 0 then
+if fatalErrorCount > 0 then
 	Process.exit(1)
 end
 
