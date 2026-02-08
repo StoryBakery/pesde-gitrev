@@ -321,26 +321,56 @@ local function collectStoryAliases(content: string): { string: true }
 	return storyAliases
 end
 
-local function buildOverrideCandidates(params)
-	local lockfile = params.Lockfile
-	local storyAliases = params.StoryAliases
+local function buildStoryAliasesByLower(storyAliases): { [string]: true }
+	local storyAliasesByLower = {}
+	for alias in storyAliases do
+		storyAliasesByLower[alias:lower()] = true
+	end
+	return storyAliasesByLower
+end
 
-	local graph = lockfile.graph
-	if type(graph) ~= "table" then
-		return {}, { Code = "InvalidLockfileGraph" }
+local function addAliasIdentity(
+	aliasIdentitySetByLower: { [string]: { [string]: true } },
+	alias: string,
+	identity: string
+)
+	local aliasLower = alias:lower()
+	if aliasIdentitySetByLower[aliasLower] == nil then
+		aliasIdentitySetByLower[aliasLower] = {}
+	end
+	aliasIdentitySetByLower[aliasLower][identity] = true
+end
+
+local function getFormat2NodeIdentity(nodeId: string): string?
+	local identity = nodeId:match("^(.-)@")
+	if identity ~= nil then
+		return identity
+	end
+	return nodeId
+end
+
+local function makeOverrideCandidates(overrideByPath): { { Path: string, Alias: string } }
+	local overrideCandidates = {}
+	for path, alias in overrideByPath do
+		table.insert(overrideCandidates, {
+			Path = path,
+			Alias = alias,
+		})
 	end
 
-	local importers = graph.importers
-	if type(importers) ~= "table" then
-		return {}, { Code = "InvalidLockfileImporters" }
-	end
+	table.sort(overrideCandidates, function(left, right)
+		return left.Path < right.Path
+	end)
 
-	local nodes = graph.nodes
-	if type(nodes) ~= "table" then
-		return {}, { Code = "InvalidLockfileNodes" }
-	end
+	return overrideCandidates
+end
 
-	local storyAliasIdentities = {}
+local function buildOverrideCandidatesFromFormat3(params)
+	local importers = params.Importers
+	local nodes = params.Nodes
+	local storyAliasesByLower = params.StoryAliasesByLower
+
+	local storyAliasIdentitiesByLower = {}
 	local queue = {}
 	for _, importerInfo in importers do
 		if type(importerInfo) == "table" then
@@ -350,13 +380,10 @@ local function buildOverrideCandidates(params)
 					if type(alias) == "string" then
 						local packageId = getPackageIdFromTuple(dependencyInfo)
 						if packageId ~= nil then
-							if storyAliases[alias] then
+							if storyAliasesByLower[alias:lower()] then
 								local identity = getPackageIdentity(packageId)
 								if identity ~= nil then
-									if storyAliasIdentities[alias] == nil then
-										storyAliasIdentities[alias] = {}
-									end
-									storyAliasIdentities[alias][identity] = true
+									addAliasIdentity(storyAliasIdentitiesByLower, alias, identity)
 								end
 							end
 
@@ -392,9 +419,10 @@ local function buildOverrideCandidates(params)
 							table.insert(nextAliases, alias)
 
 							local dependencyPackageId = getPackageIdFromTuple(dependencyInfo)
-							if storyAliases[alias] and dependencyPackageId ~= nil then
+							local aliasLower = alias:lower()
+							if storyAliasesByLower[aliasLower] and dependencyPackageId ~= nil then
 								local identity = getPackageIdentity(dependencyPackageId)
-								local expectedIdentitySet = storyAliasIdentities[alias]
+								local expectedIdentitySet = storyAliasIdentitiesByLower[aliasLower]
 								if identity ~= nil and expectedIdentitySet ~= nil and expectedIdentitySet[identity] then
 									local path = table.concat(nextAliases, ">")
 									if overrideByPath[path] == nil then
@@ -422,19 +450,117 @@ local function buildOverrideCandidates(params)
 		end
 	end
 
-	local overrideCandidates = {}
-	for path, alias in overrideByPath do
-		table.insert(overrideCandidates, {
-			Path = path,
-			Alias = alias,
+	return makeOverrideCandidates(overrideByPath), nil
+end
+
+local function buildOverrideCandidatesFromFormat2(params)
+	local graph = params.Graph
+	local storyAliasesByLower = params.StoryAliasesByLower
+
+	local storyAliasIdentitiesByLower = {}
+	local queue = {}
+	for nodeId, nodeInfo in graph do
+		if type(nodeId) == "string" and type(nodeInfo) == "table" then
+			local directInfo = nodeInfo.direct
+			if type(directInfo) == "table" then
+				local alias = directInfo[1]
+				if type(alias) == "string" then
+					local aliasLower = alias:lower()
+					if storyAliasesByLower[aliasLower] then
+						local identity = getFormat2NodeIdentity(nodeId)
+						if identity ~= nil then
+							addAliasIdentity(storyAliasIdentitiesByLower, alias, identity)
+						end
+					end
+
+					table.insert(queue, {
+						PackageId = nodeId,
+						Aliases = { alias },
+						Depth = 1,
+						VisitedPackageIds = {
+							[nodeId] = true,
+						},
+					})
+				end
+			end
+		end
+	end
+
+	local overrideByPath = {}
+	local queueIndex = 1
+	while queueIndex <= #queue do
+		local item = queue[queueIndex]
+		queueIndex += 1
+
+		if item.Depth < MAX_OVERRIDE_DEPTH then
+			local nodeInfo = graph[item.PackageId]
+			if type(nodeInfo) == "table" then
+				local dependencies = nodeInfo.dependencies
+				if type(dependencies) == "table" then
+					for alias, dependencyInfo in dependencies do
+						if type(alias) == "string" then
+							local nextAliases = copyArray(item.Aliases)
+							table.insert(nextAliases, alias)
+
+							local dependencyPackageId = getPackageIdFromTuple(dependencyInfo)
+							local aliasLower = alias:lower()
+							if storyAliasesByLower[aliasLower] and dependencyPackageId ~= nil then
+								local identity = getFormat2NodeIdentity(dependencyPackageId)
+								local expectedIdentitySet = storyAliasIdentitiesByLower[aliasLower]
+								if identity ~= nil and expectedIdentitySet ~= nil and expectedIdentitySet[identity] then
+									local path = table.concat(nextAliases, ">")
+									if overrideByPath[path] == nil then
+										overrideByPath[path] = alias
+									end
+								end
+							end
+
+							if dependencyPackageId ~= nil
+								and not item.VisitedPackageIds[dependencyPackageId]
+							then
+								local visitedPackageIds = copySet(item.VisitedPackageIds)
+								visitedPackageIds[dependencyPackageId] = true
+								table.insert(queue, {
+									PackageId = dependencyPackageId,
+									Aliases = nextAliases,
+									Depth = item.Depth + 1,
+									VisitedPackageIds = visitedPackageIds,
+								})
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return makeOverrideCandidates(overrideByPath), nil
+end
+
+local function buildOverrideCandidates(params)
+	local lockfile = params.Lockfile
+	local storyAliases = params.StoryAliases
+
+	local graph = lockfile.graph
+	if type(graph) ~= "table" then
+		return {}, { Code = "InvalidLockfileGraph" }
+	end
+
+	local storyAliasesByLower = buildStoryAliasesByLower(storyAliases)
+	local importers = graph.importers
+	local nodes = graph.nodes
+	if type(importers) == "table" and type(nodes) == "table" then
+		return buildOverrideCandidatesFromFormat3({
+			Importers = importers,
+			Nodes = nodes,
+			StoryAliasesByLower = storyAliasesByLower,
 		})
 	end
 
-	table.sort(overrideCandidates, function(left, right)
-		return left.Path < right.Path
-	end)
-
-	return overrideCandidates, nil
+	return buildOverrideCandidatesFromFormat2({
+		Graph = graph,
+		StoryAliasesByLower = storyAliasesByLower,
+	})
 end
 
 local function addOverridesToContent(params)
